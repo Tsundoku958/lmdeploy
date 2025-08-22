@@ -178,6 +178,8 @@ class BlockTrie:
 
         evicted_blocks = []
         leaves = list(self.leaves)
+        if len(self.leaves) == 0:
+            return 0
 
         # filter ref-cnt == 1 (trie own one block ref)
         leave_blocks = np.array(list(leaf.block for leaf in leaves))
