@@ -246,7 +246,11 @@ class Scheduler:
     def _schedule_decoding(self, prealloc_size: int = 0):
         """Schedule decoding."""
 
-        running = self.running
+        def _reorder_running():
+            """Reorder running."""
+            return sorted(self.running, key=lambda seq: seq.arrive_time, reverse=True)
+
+        running = _reorder_running()
         assert len(running) != 0
 
         eviction_helper = self.eviction_helper
