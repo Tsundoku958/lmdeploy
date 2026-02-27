@@ -23,7 +23,6 @@ def _task_callback(task: asyncio.Task) -> None:
         task.result()
     except asyncio.CancelledError:
         logger.debug(f'Task <{task_name}> cancelled.')
-        return
     except Exception:
         logger.exception(f'Task <{task_name}> failed')
     finally:
@@ -48,6 +47,8 @@ class AsyncRPCServer:
         self._stream_idx = 0
         self._engine_output_gather = EngineOutputGather()
 
+        self.tasks = set()
+
     def get_port(self):
         return self.port
 
@@ -68,7 +69,10 @@ class AsyncRPCServer:
 
     def send_multipart(self, client_id: bytes, data: bytes):
         """Send multipart message to client."""
-        self.socket.send_multipart([client_id, pickle.dumps(data)])
+        try:
+            self.socket.send_multipart([client_id, pickle.dumps(data)])
+        except zmq.ZMQError as e:
+            logger.error(f'Failed to send message to client[{client_id}]: {e}')
 
     def call_method_default(self, client_id, method: Callable, request: Dict):
         request_id = request.get('request_id')
@@ -90,14 +94,24 @@ class AsyncRPCServer:
             response = dict(success=False, request_id=request_id, error=str(e))
         self.send_multipart(client_id, response)
 
-    async def _method_async_streaming_task(self, stream_id, method: Callable, args: tuple, kwargs: Dict):
+    async def _method_async_streaming_task(self, stream_id: int, request_id: int, client_id: int, method: Callable,
+                                           args: tuple, kwargs: Dict):
         """Call method in a task for streaming."""
+
+        def __send_resp():
+            response = dict(success=True, request_id=request_id, result=stream_id)
+            session_id = kwargs.get('session_id', None)
+            if session_id is None:
+                session_id = args[0]
+            self.send_multipart(client_id, response)
+
         stream_out = dict(
             event=asyncio.Event(),
             result=None,
             stopped=False,
         )
         self.stream_output[stream_id] = stream_out
+        __send_resp()
         try:
             generator = method(*args, **kwargs)
             async for result in generator:
@@ -116,7 +130,7 @@ class AsyncRPCServer:
             raise ValueError(f'Stream ID {stream_id} not found')
         stream_out = self.stream_output[stream_id]
         event = stream_out['event']
-        await stream_out['event'].wait()
+        await event.wait()
         event.clear()
         result = stream_out['result']
         stopped = stream_out['stopped']
@@ -124,10 +138,10 @@ class AsyncRPCServer:
         if stopped:
             self.stream_output.pop(stream_id)
         if 'error' in stream_out:
-            raise Exception(stream_out['error'])
+            raise stream_out['error']
         return result, stopped
 
-    def call_method_async(self, client_id, method: Callable, request: Dict):
+    async def call_method_async(self, client_id, method: Callable, request: Dict):
         """Call method async."""
         request_id = request.get('request_id')
         method_name = request.get('method')
@@ -138,11 +152,16 @@ class AsyncRPCServer:
         if request.get('streaming', False):
             # if method is a streaming method, use a different task
             stream_id = self._get_next_stream_id()
-            event_loop.create_task(self._method_async_streaming_task(stream_id, method, args, kwargs), name=name)
-            response = dict(success=True, request_id=request_id, result=stream_id)
-            self.send_multipart(client_id, response)
+            task = event_loop.create_task(self._method_async_streaming_task(stream_id, request_id, client_id, method,
+                                                                            args, kwargs),
+                                          name=name)
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
         else:
-            event_loop.create_task(self._method_async_task(client_id, request_id, method, args, kwargs), name=name)
+            task = event_loop.create_task(self._method_async_task(client_id, request_id, method, args, kwargs),
+                                          name=name)
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
 
     async def call_and_response(self):
         """Call method."""
@@ -159,7 +178,7 @@ class AsyncRPCServer:
         else:
             method_type, method = self.methods[method_name]
             if method_type in ('async', 'async_streaming'):
-                self.call_method_async(client_id, method, request)
+                await self.call_method_async(client_id, method, request)
             else:
                 self.call_method_default(client_id, method, request)
 
@@ -171,12 +190,13 @@ class AsyncRPCServer:
 
         self.register_method('_asyncrpcserver_get_stream_output', self.get_stream_output)
         try:
+            events = await poller.poll(timeout=10)
             while self.running:
-                events = await poller.poll(timeout=10)
-                if self.socket in dict(events):
+                while self.socket in dict(events):
                     await self.call_and_response()
-                else:
-                    await asyncio.sleep(0)
+                    events = await poller.poll(timeout=0)
+                events = await poller.poll(timeout=10)
+
         except zmq.ZMQError:
             logger.exception('ZMQRPCServer error')
         except Exception:
@@ -189,6 +209,8 @@ class AsyncRPCServer:
 
     def stop(self):
         self.running = False
+        for task in self.tasks:
+            task.cancel()
 
 
 class AsyncRPCClient:
@@ -203,6 +225,8 @@ class AsyncRPCClient:
         self.sync_ctx = zmq.Context()
         self.sync_socket = self.sync_ctx.socket(socket_type)
         self.sync_socket.connect(address)
+        self.sync_poller = zmq.Poller()
+        self.sync_poller.register(self.sync_socket, zmq.POLLIN)
 
         # async socket
         self.async_ctx = Context.instance()
@@ -229,6 +253,14 @@ class AsyncRPCClient:
         request_id = reply['request_id']
         self._set_reply_default(request_id, reply)
 
+    def _poll_recv(self, timeout: float = 3):
+        """Poll and receive message."""
+        # socket.recv would block the process, use poll to avoid hanging
+        while True:
+            sockets = dict(self.sync_poller.poll(timeout=timeout * 1000))
+            if self.sync_socket in sockets:
+                return self.sync_socket.recv()
+
     def _try_start_listen(self):
         """Try to start listening on async socket."""
         if self._listen_task is None or self._listen_task.done():
@@ -242,11 +274,11 @@ class AsyncRPCClient:
         data = pickle.dumps(dict(request_id=request_id, method=method, args=args, kwargs=kwargs))
         self.sync_socket.send(data)
 
-        reply = self.sync_socket.recv()
+        reply = self._poll_recv()
         reply = pickle.loads(reply)
         while reply['request_id'] != request_id:
             self._set_reply(reply)
-            reply = self.sync_socket.recv()
+            reply = self._poll_recv()
             reply = pickle.loads(reply)
 
         logger.debug(f'recv reply request_id: {request_id}')

@@ -105,26 +105,16 @@ struct EngineParam {
     int attn_dp_rank;
     int attn_tp_size;
     int attn_tp_rank;
+    int attn_cp_size;
+    int attn_cp_rank;
     int mlp_tp_size;
     int mlp_tp_rank;
 
+    // multi-node
+    int nnodes;
+    int node_rank;
+
     std::vector<int> devices;
-};
-
-enum class LoraPolicy : int
-{
-    kNull,
-    kPlora,
-};
-
-struct LoraParam {
-    int        r;
-    float      scale;
-    LoraPolicy policy;
-    int        max_wo_r;
-
-    std::map<std::string, std::pair<std::regex, int>>   rank_pattern;
-    std::map<std::string, std::pair<std::regex, float>> scale_pattern;
 };
 
 }  // namespace turbomind

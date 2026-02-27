@@ -77,17 +77,13 @@ class EngineWorkerBase:
         """Get engine config."""
         return self.engine.get_engine_config()
 
-    def get_model_config(self):
-        """Get model config."""
-        return self.engine.get_model_config()
-
     def get_schedule_metrics(self):
         """Get schedule metrics."""
         return self.engine.get_schedule_metrics()
 
-    async def p2p_initialize(self, conn_request: DistServeInitRequest):
+    def p2p_initialize(self, conn_request: DistServeInitRequest):
         """Init rdma link."""
-        return await self.engine.p2p_initialize(conn_request)
+        return self.engine.p2p_initialize(conn_request)
 
     def p2p_connect(self, conn_request: DistServeConnectionRequest):
         """rdma_connect."""

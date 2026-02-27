@@ -51,6 +51,7 @@ class BaseOutputModel(ABC):
         self.attention_config = cfg.attention_config
         self.lora_config = cfg.lora_config
         self.attn_tp_size = self.model_config.attn_tp_size
+        self.attn_cp_size = self.model_config.attn_cp_size
         self.mlp_tp_size = self.model_config.mlp_tp_size
         self.out_dir = out_dir
         self.to_file = True if out_dir else False
@@ -161,9 +162,10 @@ class BaseOutputModel(ABC):
                     torch_tensor = torch_tensor.bfloat16()
                 else:
                     torch_tensor = torch_tensor.half()
-            for tm_tensor in tm_params[name]:
-                tm_tensor.copy_from(torch_tensor)
-            tm_params.pop(name)
+            if name in tm_params:
+                for tm_tensor in tm_params[name]:
+                    tm_tensor.copy_from(torch_tensor)
+                tm_params.pop(name)
         else:
             tprint('skip export', name, param.shape)
 

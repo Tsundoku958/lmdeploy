@@ -3,7 +3,8 @@
 import os
 
 from ..version import __version__
-from .utils import ArgumentHelper, DefaultsAndTypesHelpFormatter, FlexibleArgumentParser, convert_args
+from .utils import (ArgumentHelper, DefaultsAndTypesHelpFormatter, FlexibleArgumentParser, convert_args,
+                    get_speculative_config)
 
 
 class CLI(object):
@@ -12,15 +13,6 @@ class CLI(object):
     parser = FlexibleArgumentParser(prog='lmdeploy', description=_desc, add_help=True)
     parser.add_argument('-v', '--version', action='version', version=__version__)
     subparsers = parser.add_subparsers(title='Commands', description='lmdeploy has following commands:', dest='command')
-
-    @staticmethod
-    def add_parser_list():
-        """Add parser for list command."""
-        parser = CLI.subparsers.add_parser('list',
-                                           formatter_class=DefaultsAndTypesHelpFormatter,
-                                           description=CLI.list.__doc__,
-                                           help=CLI.list.__doc__)
-        parser.set_defaults(run=CLI.list)
 
     @staticmethod
     def add_parser_chat():
@@ -44,12 +36,12 @@ class CLI(object):
                             ', "baichuan-inc/baichuan2-7b-chat" and so on')
         # common args
         ArgumentHelper.backend(parser)
-        # # chat template args
+        # chat template args
         ArgumentHelper.chat_template(parser)
         # model args
         ArgumentHelper.revision(parser)
         ArgumentHelper.download_dir(parser)
-        #
+
         # pytorch engine args
         pt_group = parser.add_argument_group('PyTorch engine arguments')
         ArgumentHelper.adapters(pt_group)
@@ -76,6 +68,11 @@ class CLI(object):
         ArgumentHelper.model_format(tb_group)
         ArgumentHelper.rope_scaling_factor(tb_group)
         ArgumentHelper.communicator(tb_group)
+        ArgumentHelper.cp(tb_group)
+        ArgumentHelper.async_(tb_group)
+
+        # speculative decoding
+        ArgumentHelper.add_spec_group(parser)
 
     @staticmethod
     def add_parser_checkenv():
@@ -91,15 +88,6 @@ class CLI(object):
                             help='The file path to save env info. Only '
                             'support file format in `json`, `yml`,'
                             ' `pkl`')
-
-    @staticmethod
-    def list(args):
-        """List the supported model names."""
-        from lmdeploy.model import MODELS
-        model_names = list(MODELS.module_dict.keys())
-        model_names.sort()
-        print('The supported chat template names are:')
-        print('\n'.join(model_names))
 
     @staticmethod
     def check_env(args):
@@ -168,12 +156,17 @@ class CLI(object):
     @staticmethod
     def chat(args):
         from .chat import main
+
         kwargs = convert_args(args)
+        speculative_config = get_speculative_config(args)
+        to_remove = ['speculative_algorithm', 'speculative_draft_model', 'speculative_num_draft_tokens']
+        for key in to_remove:
+            kwargs.pop(key)
+        kwargs['speculative_config'] = speculative_config
         main(**kwargs)
 
     @staticmethod
     def add_parsers():
         """Add all parsers."""
-        CLI.add_parser_list()
         CLI.add_parser_checkenv()
         CLI.add_parser_chat()

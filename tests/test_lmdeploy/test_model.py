@@ -1,6 +1,6 @@
 import pytest
 
-from lmdeploy.model import MODELS, best_match_model
+from lmdeploy.model import MODELS
 
 HF_MODELS_WITH_CHAT_TEMPLATES = [
     'Qwen/Qwen1.5-7B-Chat',
@@ -81,28 +81,6 @@ def test_HFChatTemplate_message2prompt_sequence_start_True(model_path):
     expected = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     assert model.messages2prompt(prompt, sequence_start=True) == expected
     assert model.messages2prompt(messages, sequence_start=True) == expected
-
-
-@pytest.mark.parametrize('model_path', HF_MODELS_WITH_CHAT_TEMPLATES)
-def test_best_match_model_hf(model_path):
-    assert best_match_model(model_path) == 'hf'
-
-
-@pytest.mark.parametrize('model_path_and_name', [
-    ('internlm/internlm-chat-7b', ['internlm']),
-    ('internlm/internlm2-1_8b', ['base']),
-    ('codellama/CodeLlama-7b-hf', ['codellama']),
-    ('meta-llama/Llama-2-7b-chat-hf', ['llama2']),
-    ('THUDM/chatglm2-6b', ['chatglm']),
-    ('codellama/CodeLlama-34b-Instruct-hf', ['codellama']),
-    ('deepseek-ai/deepseek-vl-7b-chat', ['deepseek-vl']),
-])
-def test_best_match_model(model_path_and_name):
-    deduced_name = best_match_model(model_path_and_name[0])
-    if deduced_name is not None:
-        assert deduced_name in model_path_and_name[1], f'expect {model_path_and_name[1]}, but got {deduced_name}'
-    else:
-        assert deduced_name in model_path_and_name[1], f'expect {model_path_and_name[1]}, but got {deduced_name}'
 
 
 def test_base_model():
@@ -247,10 +225,7 @@ def test_codellama_others():
     'model_path_or_name',
     ['deepseek-ai/deepseek-vl2-tiny', 'deepseek-ai/deepseek-vl2-small', 'deepseek-ai/deepseek-vl2'])
 def test_deepseek_vl2(model_path_or_name):
-    deduced_name = best_match_model(model_path_or_name)
-    assert deduced_name == 'deepseek-vl2'
-
-    chat_template = MODELS.get(deduced_name)()
+    chat_template = MODELS.get('deepseek-vl2')()
     messages = [{
         'role': 'user',
         'content': 'This is image_1: <image>\n'
@@ -272,15 +247,13 @@ def test_deepseek_vl2(model_path_or_name):
     assert ref == lm_res
 
 
-@pytest.mark.parametrize('model_path', ['Qwen/Qwen3-30B-A3B', 'Qwen/Qwen2.5-7B-Instruct'])
+@pytest.mark.parametrize('model_path', ['Qwen/Qwen3-30B-A3B', 'Qwen/Qwen2.5-7B-Instruct', 'Qwen/Qwen3.5-35B-A3B'])
 @pytest.mark.parametrize('enable_thinking', [True, False, None])
 def test_qwen3(model_path, enable_thinking):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    chat_template_name = best_match_model(model_path)
-    assert chat_template_name == 'hf'
-    chat_template = MODELS.get(chat_template_name)(model_path)
+    chat_template = MODELS.get('hf')(model_path)
 
     messages = [{
         'role': 'system',
@@ -316,8 +289,7 @@ def test_interns1(model_path, enable_thinking, has_user_sys):
     except OSError:
         pytest.skip(reason=f'{model_path} not exists')
 
-    chat_template_name = best_match_model(model_path)
-    chat_template = MODELS.get(chat_template_name)(model_path)
+    chat_template = MODELS.get('hf')(model_path)
 
     messages = [{
         'role': 'system',
@@ -356,20 +328,14 @@ def test_HFChatTemplate_get_prompt_sequence_start_False_Qwen(model_path):
                             sequence_start=False) == f'<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n'
 
 
-@pytest.mark.parametrize('model_path', ['internlm/Intern-S1', 'internlm/Intern-S1-mini'])
-def test_InternS1_thinking(model_path):
-    pass
+@pytest.mark.parametrize('model_path', ['Qwen/Qwen3.5-35B-A3B'])
+def test_HFChatTemplate_get_prompt_sequence_start_False_Qwen3_5(model_path):
+    model = MODELS.get('hf')(model_path=model_path)
+    assert model.stop_words == ['<|im_end|>']
 
-
-@pytest.mark.parametrize('model_path', [''])
-def test_InternVL(model_path):
-    pass
-
-
-@pytest.mark.parametrize('model_path', [''])
-def test_HFChatTemplate_llama(model_path):
-    # TODO: add a huggingface token to github
-    pass
+    prompt = 'How to apply chat template using transformers?'
+    assert model.get_prompt(
+        prompt, sequence_start=False) == f'<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n'
 
 
 @pytest.mark.parametrize('model_path', ['deepseek-ai/DeepSeek-V3'])
@@ -388,3 +354,90 @@ def test_HFChatTemplate_DeepSeek_thinking(model_path):
 
     prompt = 'How to apply chat template using transformers?'
     assert model.get_prompt(prompt, sequence_start=False) == f'<｜User｜>{prompt}<｜Assistant｜><think>\n'
+
+
+@pytest.mark.parametrize('model_path', ['Qwen/Qwen3-VL-8B-Instruct', 'Qwen/Qwen3.5-35B-A3B'])
+def test_HFChatTemplate_Qwen3_VL_with_vision_id(model_path):
+    model = MODELS.get('hf')(model_path=model_path)
+
+    # testcase from https://github.com/QwenLM/Qwen3-VL
+    messages = [
+        {
+            'role': 'user',
+            'content': [{
+                'type': 'image'
+            }, {
+                'type': 'text',
+                'text': 'Hello, how are you?'
+            }],
+        },
+        {
+            'role': 'assistant',
+            'content': "I'm doing well, thank you for asking. How can I assist you today?",
+        },
+        {
+            'role':
+            'user',
+            'content': [
+                {
+                    'type': 'text',
+                    'text': 'Can you describe these images and video?'
+                },
+                {
+                    'type': 'image'
+                },
+                {
+                    'type': 'image'
+                },
+                {
+                    'type': 'video'
+                },
+                {
+                    'type': 'text',
+                    'text': 'These are from my vacation.'
+                },
+            ],
+        },
+        {
+            'role':
+            'assistant',
+            'content':
+            """I'd be happy to describe the images and video for you.
+                Could you please provide more context about your vacation?""",
+        },
+        {
+            'role': 'user',
+            'content': 'It was a trip to the mountains. Can you see the details in the images and video?',
+        },
+    ]
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    expected = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, add_vision_id=True)
+    chat_template_kwargs = dict(add_vision_id=True)
+    lm_res = model.messages2prompt(messages, **chat_template_kwargs)
+    assert expected == lm_res
+
+
+@pytest.mark.parametrize('model_path', ['google/gemma-2-9b-it', 'google/gemma-3-12b-it'])
+def test_gemma_chat_template(model_path):
+    messages = [{'role': 'user', 'content': 'who are you'}]
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    expected = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    model = MODELS.get('hf')(model_path=model_path)
+    lm_res = model.messages2prompt(messages)
+    assert expected == lm_res
+
+    messages += [{'role': 'assistant', 'content': 'I am an AI'}, {'role': 'user', 'content': 'AGI is?'}]
+    lm_res = model.messages2prompt(messages, sequence_start=False)
+    assert lm_res == """<start_of_turn>user
+who are you<end_of_turn>
+<start_of_turn>model
+I am an AI<end_of_turn>
+<start_of_turn>user
+AGI is?<end_of_turn>
+<start_of_turn>model
+"""

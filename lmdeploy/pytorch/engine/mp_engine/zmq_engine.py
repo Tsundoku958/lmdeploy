@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch.multiprocessing as mp
 
-from lmdeploy.messages import PytorchEngineConfig
+from lmdeploy.messages import PytorchEngineConfig, SpeculativeConfig
 from lmdeploy.utils import get_logger
 
 from .base import MPEngine
@@ -29,20 +29,30 @@ def cancel_async_tasks(loop: asyncio.AbstractEventLoop):
 
 class ZMQMPEngine(MPEngine):
 
-    def __init__(self, model_path: str, engine_config: PytorchEngineConfig = None, **kwargs) -> None:
+    def __init__(self,
+                 model_path: str,
+                 engine_config: PytorchEngineConfig = None,
+                 speculative_config: SpeculativeConfig = None,
+                 **kwargs) -> None:
         """Initialize mp engine."""
         from .zmq_rpc import AsyncRPCClient
         self.shared_dict = None
         self.port = None
         self.proc = None
-        self._start_mp_proc(model_path, engine_config)
+        self._start_mp_proc(model_path, engine_config, speculative_config=speculative_config, **kwargs)
 
         self.rpc_client = AsyncRPCClient(port=self.port)
 
         super().__init__()
         atexit.register(self.close)
 
-    def _start_mp_proc(self, model_path: str, engine_config: PytorchEngineConfig = None):
+    def _start_mp_proc(
+        self,
+        model_path: str,
+        engine_config: PytorchEngineConfig = None,
+        speculative_config: SpeculativeConfig = None,
+        **kwargs,
+    ):
         """Start mp proc."""
         logger.debug('Starting engine multi-process.')
         with mp.Manager() as manager:
@@ -50,14 +60,17 @@ class ZMQMPEngine(MPEngine):
             condition = manager.Condition()
             self.mp_ctx = mp.get_context('spawn')
             log_level = logger.level
+            target_kwargs = dict(
+                model_path=model_path,
+                engine_config=engine_config,
+                log_level=log_level,
+                speculative_config=speculative_config,
+            )
+            target_kwargs.update(kwargs)
             self.proc = self.mp_ctx.Process(
                 target=self._mp_proc,
                 args=(self.shared_dict, condition),
-                kwargs=(dict(
-                    model_path=model_path,
-                    engine_config=engine_config,
-                    log_level=log_level,
-                )),
+                kwargs=target_kwargs,
                 name='mp_engine_proc',
             )
             self.proc.start()
@@ -68,11 +81,15 @@ class ZMQMPEngine(MPEngine):
             self.port = self.shared_dict['rpc_server_port']
 
     @staticmethod
-    def _mp_proc(shared_dict: dict,
-                 condition: mp.Condition,
-                 model_path: str,
-                 engine_config: PytorchEngineConfig = None,
-                 log_level: str = 'WARNING'):
+    def _mp_proc(
+        shared_dict: dict,
+        condition: mp.Condition,
+        model_path: str,
+        engine_config: PytorchEngineConfig = None,
+        log_level: str = 'WARNING',
+        speculative_config: SpeculativeConfig = None,
+        **kwargs,
+    ):
         """Mp process function."""
         from lmdeploy.pytorch.engine import Engine
 
@@ -92,25 +109,17 @@ class ZMQMPEngine(MPEngine):
         engine = Engine.from_pretrained(
             model_path,
             engine_config=engine_config,
+            speculative_config=speculative_config,
+            **kwargs,
         )
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        def _signal_handler(signum, frame):
-            """Signal handler to stop the server."""
-            logger.info(f'Received signal {signum}, stopping server.')
-            exit(0)
-
-        signal.signal(signal.SIGTERM, _signal_handler)
         try:
             loop.run_until_complete(ZMQMPEngine._mp_proc_async(server, engine))
         except KeyboardInterrupt:
             logger.info('Received KeyboardInterrupt, stopping mp process.')
-        finally:
-            server.stop()
-            engine.close()
-            cancel_async_tasks(loop)
 
     @staticmethod
     async def _mp_proc_async(server, engine: 'Engine'):
@@ -118,6 +127,18 @@ class ZMQMPEngine(MPEngine):
         import inspect
 
         from .base_worker import EngineWorkerBase
+
+        loop = asyncio.get_running_loop()
+        current_task = asyncio.current_task()
+
+        async def shutdown(loop, signame):
+            logger.info(f'MP process received signal {signame}, stopping server.')
+            if current_task is not None:
+                current_task.cancel()
+
+        for signame in {'SIGINT', 'SIGTERM'}:
+            sig = getattr(signal, signame)
+            loop.add_signal_handler(sig, lambda signame=signame: asyncio.create_task(shutdown(loop, signame)))
 
         worker = EngineWorkerBase(engine)
 
@@ -129,8 +150,19 @@ class ZMQMPEngine(MPEngine):
         try:
             # run server
             await server.run()
+        except asyncio.CancelledError:
+            logger.info('RPC Server stopping due to cancellation.')
         except Exception as e:
             logger.error(f'RPC Server stopped with exception: {e}')
+        finally:
+            server.stop()
+            engine.close()
+            try:
+                await engine.wait_tasks()
+            except asyncio.CancelledError:
+                logger.info('Engine wait_tasks cancelled during shutdown.')
+            except Exception as e:
+                logger.debug(f'Engine wait_tasks failed during shutdown: {e}')
 
     def _collective_rpc(self, func, *args, **kwargs):
         """Collective rpc call."""
@@ -153,6 +185,11 @@ class ZMQMPEngine(MPEngine):
         self.rpc_client.stop()
         self.proc.terminate()
         self.proc.join(10)
+        if not self.proc.is_alive():
+            self.proc.close()
+        else:
+            logger.warning('MP process did not terminate in time, force killing.')
+            self.proc.kill()
         self.proc = None
 
     def start_loop(self) -> None:

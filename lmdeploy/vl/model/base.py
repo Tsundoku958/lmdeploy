@@ -12,7 +12,7 @@ from lmdeploy.archs import get_model_arch
 VISION_MODELS = Registry('vision_model')
 
 
-class VisonModel(ABC):
+class VisionModel(ABC):
     """Visual model which extract image feature."""
     _arch: Union[str, List[str]] = None
 
@@ -132,7 +132,7 @@ class VisonModel(ABC):
         if self.backend == 'turbomind':
             raise NotImplementedError()
 
-    def to_pytorch(self, messages, chat_template, tokenizer, sequence_start, **kwargs):
+    def to_pytorch(self, messages, chat_template, tokenizer, sequence_start, chat_template_kwargs=None, **kwargs):
         """Pack the preprocessing results in a format compatible with what is
         required by pytorch engine. ONLY implement it when the backend is
         pytorch engine.
@@ -142,11 +142,13 @@ class VisonModel(ABC):
             chat_template: the chat template defined in `lmdeploy/model.py`
             tokenzer: the tokenizer model
             sequence_start: starting flag of a sequence
+            chat_template_kwargs: additional arguments for chat template
+                processing, such as `add_vision_id` and `enable_thinking`
         """
         if self.backend == 'pytorch':
             raise NotImplementedError()
 
-    def to_turbomind(self, messages, chat_template, tokenizer, sequence_start, **kwargs):
+    def to_turbomind(self, messages, chat_template, tokenizer, sequence_start, chat_template_kwargs=None, **kwargs):
         """Pack the forwarding results in a format compatible with what is
         required by turbomind engine. ONLY implement it when the backend is
         turbomind engine.
@@ -156,6 +158,8 @@ class VisonModel(ABC):
             chat_template: the chat template defined in `lmdeploy/model.py`
             tokenzer: the tokenizer model
             sequence_start: starting flag of a sequence
+            chat_template_kwargs: additional arguments for chat template
+                processing, such as `add_vision_id` and `enable_thinking`
         """
         if self.backend == 'turbomind':
             raise NotImplementedError()
@@ -180,6 +184,47 @@ class VisonModel(ABC):
                 for k, v in x.items() if k not in {'type', 'image'}
             }) for x in content if x['type'] == 'image'])
         return images
+
+    @staticmethod
+    def collect_time_series(messages):
+        """Gather all time series data along with their respective parameters
+        from the messages and compile them into a single list.
+
+        Args:
+            messages (List[Tuple[np.ndarray, Dict]]): a list of time
+                series data with their corresponding parameters
+        """  # noqa
+        time_series = []
+        for message in messages:
+            content = message['content']
+            if not isinstance(content, List):
+                continue
+            time_series.extend([(x['time_series'], {
+                k: v
+                for k, v in x.items() if k not in {'type', 'time_series'}
+            }) for x in content if x['type'] == 'time_series'])
+        return time_series
+
+    @staticmethod
+    def IMAGE_TOKEN_included(messages):
+        """Check whether the IMAGE_TOKEN is included in the messages.
+
+        Args:
+            messages (List[Dict]): a list of message
+        Returns:
+            bool: whether the IMAGE_TOKEN is included in the messages
+        """
+        for message in messages:
+            role, content = message['role'], message['content']
+            if role != 'user':
+                continue
+            if isinstance(content, str) and '<IMAGE_TOKEN>' in content:
+                return True
+            elif isinstance(content, List):
+                content = [x['text'] for x in content if x['type'] == 'text']
+                if any('<IMAGE_TOKEN>' in x for x in content):
+                    return True
+        return False
 
     def to_pytorch_with_input_ids(self, messages):
         """Pack the preprocessing results in a format compatible with what is
@@ -268,7 +313,7 @@ class VisonModel(ABC):
         # collect image features from messages
         features = [x['content'] for x in messages if x['role'] == 'forward']
         features = features[0]
-        features = [x.cpu().numpy() for x in features]
+        features = [x.cpu() for x in features]
         # split prompt into segments and validate data
         segs = prompt.split(IMAGE_TOKEN)
         assert len(segs) == len(features) + 1, (f'the number of {IMAGE_TOKEN} is not equal '

@@ -141,6 +141,8 @@ def visualize_pipe_out(outputs, enable_meta: bool = True):
 
     if isinstance(outputs, Response):
         outputs = [outputs]
+    elif outputs is None:
+        outputs = [outputs]
     try:
         term_size = os.get_terminal_size().columns
     except Exception:
@@ -168,6 +170,15 @@ def visualize_pipe_out(outputs, enable_meta: bool = True):
             f"{colored('• Generated Tokens:', meta_color)} {colored(out.generate_token_len, number_color)}",
             f"{colored('• Finish Reason:', meta_color)}    {colored(out.finish_reason, finish_color)}"
         ]
+        if out.routed_experts is not None:
+            shape = tuple(out.routed_experts.shape)
+            meta_content.append(f"{colored('• Routed Experts:', meta_color)}  {colored(shape, number_color)}")
+        if out.logits is not None:
+            shape = tuple(out.logits.shape)
+            meta_content.append(f"{colored('• Logits Shape:', meta_color)}     {colored(shape, number_color)}")
+        if out.logprobs is not None:
+            size = len(out.logprobs)
+            meta_content.append(f"{colored('• Logprobs:', meta_color)}      {colored(size, number_color)}")
 
         lines = '\n'.join(meta_content)
         lines += '\n'
@@ -183,12 +194,46 @@ def visualize_pipe_out(outputs, enable_meta: bool = True):
         print(header_formatted)
         print()
 
-        if enable_meta:
-            _print_meta(out)
+        if out is not None:
+            if enable_meta:
+                _print_meta(out)
 
-        _print_section('TEXT', out.text, border_color)
+            _print_section('TEXT', out.text, border_color)
 
         if idx < len(outputs) - 1:  # Add separator when it's not the last output
             print(colored('─' * (term_size), border_color, attrs=['dark']))
         else:
             print(colored('━' * term_size, border_color))
+
+
+def visualize_chat_completions(outputs, enable_meta: bool = True):
+    """Visualize chat completions."""
+    from openai.types.chat import ChatCompletion
+
+    from lmdeploy.messages import Response
+    if isinstance(outputs, ChatCompletion):
+        outputs = [outputs]
+
+    resps = []
+    for out in outputs:
+        assert isinstance(out, ChatCompletion)
+        choice = out.choices[0]
+        resp = Response(text=choice.message.content,
+                        input_token_len=out.usage.prompt_tokens,
+                        generate_token_len=out.usage.completion_tokens,
+                        finish_reason=choice.finish_reason)
+        resps.append(resp)
+
+    return visualize_pipe_out(resps, enable_meta=enable_meta)
+
+
+sources = None
+
+
+def dump_tilelang_source(kernel, path: str = 'sources/tvm_kernels.cu'):
+    global sources
+    if sources is not None:
+        return
+    sources = kernel.get_kernel_source()
+    with open(path, 'w') as f:
+        f.write(sources)

@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 import torch
 from torch.profiler import record_function
 
-from lmdeploy.pytorch.model_inputs import ModelInputs
+from lmdeploy.pytorch.model_inputs import ModelInputs, ModelInputsDelta
 
 
 @record_function('make_dummy_input')
@@ -39,6 +39,7 @@ def make_dummy_inputs(batch_size: int,
         max_kv_seqlen=max_kv_seqlen,
         sum_kv_seqlen=num_tokens,
         local_adapter_ids=local_adapter_ids,
+        is_dummy=True,
         state_offsets=state_offsets,
     )
 
@@ -53,4 +54,14 @@ class ModelInputsStrategy(ABC):
                    dummy_block_id: int = 0,
                    vocab_size: int = 1) -> ModelInputs:
         """Create dummy model inputs."""
+        pass
+
+    @abstractmethod
+    def merge(self, inputs: ModelInputs, other: ModelInputs) -> ModelInputs:
+        """Merge model inputs."""
+        pass
+
+    @abstractmethod
+    def update_inputs(self, inputs: ModelInputs, delta: 'ModelInputsDelta') -> ModelInputs:
+        """Update model inputs with delta."""
         pass

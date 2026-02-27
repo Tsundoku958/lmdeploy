@@ -19,6 +19,7 @@ project(TurboMind LANGUAGES CXX CUDA)
 if (MSVC)
     # use standard conformant preprocessor
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor -Xcompiler=/Zc:__cplusplus")
 endif ()
 
@@ -70,11 +71,9 @@ FetchContent_MakeAvailable(repo-cutlass)
 FetchContent_Declare(
   yaml-cpp
   GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-  GIT_TAG                 0.8.0
+  GIT_TAG                 65c1c270dbe7eec37b2df2531d7497c4eea79aee
   GIT_PROGRESS            TRUE
   USES_TERMINAL_DOWNLOAD  TRUE
-  PATCH_COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/cmake/yaml-cpp_cmake_policy.patch
-  UPDATE_DISCONNECTED     1
 )
 set(YAML_BUILD_SHARED_LIBS OFF CACHE BOOL "Build static library of yaml-cpp")
 FetchContent_MakeAvailable(yaml-cpp)
@@ -82,11 +81,10 @@ FetchContent_MakeAvailable(yaml-cpp)
 FetchContent_Declare(
   xgrammar
   GIT_REPOSITORY          https://github.com/mlc-ai/xgrammar.git
-  GIT_TAG                 v0.1.25
+  GIT_TAG                 v0.1.27
   GIT_SUBMODULES          "3rdparty/dlpack"
   GIT_PROGRESS            TRUE
   USES_TERMINAL_DOWNLOAD  TRUE
-  UPDATE_DISCONNECTED     1
 )
 
 FetchContent_GetProperties(xgrammar)
@@ -101,10 +99,15 @@ if(NOT xgrammar_POPULATED)
 
   # Bring the populated content into the build
   add_subdirectory(${xgrammar_SOURCE_DIR} ${xgrammar_BINARY_DIR})
+  if(TARGET xgrammar)
+    target_compile_options(xgrammar PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+    target_compile_options(xgrammar PRIVATE $<$<C_COMPILER_ID:MSVC>:/utf-8>)
+  endif()
 endif()
 
 # the environment variable
 #   ASAN_OPTIONS=protect_shadow_gap=0,intercept_tls_get_addr=0
+#   LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libasan.so.6:/usr/lib/x86_64-linux-gnu/libstdc++.so.6
 # must be set at runtime
 # https://github.com/google/sanitizers/issues/1322
 if (LMDEPLOY_ASAN_ENABLE)
@@ -157,8 +160,15 @@ endif()
 
 set(CXX_STD "17" CACHE STRING "C++ standard")
 # enable gold linker for binary and .so
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=gold")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=gold")
+if(NOT MSVC)
+  find_program(GOLD_PATH ld.gold REQUIRED)
+  if(NOT GOLD_PATH)
+    message(FATAL_ERROR "GNU gold linker is required but not found. "
+                         "Please install binutils-gold package.")
+  endif()
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=gold")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=gold")
+endif()
 set(CUDA_PATH ${CUDA_TOOLKIT_ROOT_DIR})
 
 set(CUSPARSELT_PATH "" CACHE STRING "cuSPARSELt path")
@@ -215,7 +225,10 @@ endif()
 
 if(ARCH STREQUAL "x86_64")
   if (NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 70-real 75-real)  # V100, 2080
+    set(CMAKE_CUDA_ARCHITECTURES "")
+    if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS "13.0")
+      list(APPEND CMAKE_CUDA_ARCHITECTURES 70-real 75-real)  # V100, 2080
+    endif()
     if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL "11")
       list(APPEND CMAKE_CUDA_ARCHITECTURES 80-real) # A100
     endif ()
@@ -318,6 +331,8 @@ if (MSVC)
     CMAKE_CUDA_FLAGS_RELWITHDEBINFO)
     string(REGEX REPLACE "-Wall" " /W0 " ${flag_var} "${${flag_var}}")
   endforeach()
+  # avoid min/max macro in "windows.h" conflict with std::min/std::max
+  add_definitions(-DNOMINMAX=1)
 endif()
 
 include_directories(

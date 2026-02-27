@@ -81,6 +81,7 @@ LMDeploy 工具箱提供以下核心功能：
    quantization/w4a16.md
    quantization/w8a8.md
    quantization/kv_quant.md
+   quantization/llm_compressor.md
 
 .. _测试基准:
 .. toctree::
@@ -89,6 +90,7 @@ LMDeploy 工具箱提供以下核心功能：
 
    benchmark/benchmark.md
    benchmark/evaluate_with_opencompass.md
+   benchmark/evaluate_with_vlmevalkit.md
 
 .. toctree::
    :maxdepth: 1
@@ -104,15 +106,21 @@ LMDeploy 工具箱提供以下核心功能：
    advance/pytorch_multinodes.md
    advance/pytorch_profiling.md
    advance/metrics.md
+   advance/context_parallel.md
+   advance/spec_decoding.md
+   advance/update_weights.md
 
 .. toctree::
    :maxdepth: 1
    :caption: API 文档
 
    api/pipeline.rst
+   api/openapi.rst
+   api/cli.rst
 
 索引与表格
 ==================
 
 * :ref:`genindex`
 * :ref:`search`
+* :ref:`routingtable`

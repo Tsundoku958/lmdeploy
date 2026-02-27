@@ -22,14 +22,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Mount
 
 from lmdeploy.archs import get_task
-from lmdeploy.messages import GenerationConfig, LogitsProcessor, PytorchEngineConfig, TurbomindEngineConfig
+from lmdeploy.messages import (GenerationConfig, LogitsProcessor, PytorchEngineConfig, SpeculativeConfig,
+                               TurbomindEngineConfig)
 from lmdeploy.metrics.metrics_processor import metrics_processor
 from lmdeploy.model import ChatTemplateConfig
 from lmdeploy.pytorch.disagg.config import DistServeEngineConfig
 from lmdeploy.pytorch.disagg.conn.protocol import (DistServeCacheFreeRequest, DistServeConnectionRequest,
                                                    DistServeDropConnectionRequest, DistServeInitRequest,
                                                    MigrationRequest)
-from lmdeploy.serve.async_engine import AsyncEngine
+from lmdeploy.serve.core import AsyncEngine
 from lmdeploy.serve.openai.harmony_utils import GptOssChatParser
 from lmdeploy.serve.openai.protocol import ChatCompletionResponse  # noqa: E501
 from lmdeploy.serve.openai.protocol import (AbortRequest, ChatCompletionRequest, ChatCompletionResponseChoice,
@@ -38,9 +39,9 @@ from lmdeploy.serve.openai.protocol import (AbortRequest, ChatCompletionRequest,
                                             CompletionResponse, CompletionResponseChoice,
                                             CompletionResponseStreamChoice, CompletionStreamResponse, DeltaMessage,
                                             EmbeddingsRequest, EncodeRequest, EncodeResponse, ErrorResponse,
-                                            GenerateReqInput, GenerateReqMetaOutput, GenerateReqOutput, GenerateRequest,
-                                            LogProbs, ModelCard, ModelList, ModelPermission, PoolingRequest,
-                                            PoolingResponse, TopLogprob, UpdateParamsRequest, UsageInfo)
+                                            GenerateReqInput, GenerateReqMetaOutput, GenerateReqOutput, LogProbs,
+                                            ModelCard, ModelList, ModelPermission, PoolingRequest, PoolingResponse,
+                                            TopLogprob, UpdateParamsRequest, UsageInfo)
 from lmdeploy.serve.openai.reasoning_parser.reasoning_parser import ReasoningParser, ReasoningParserManager
 from lmdeploy.serve.openai.tool_parser.tool_parser import ToolParser, ToolParserManager
 from lmdeploy.tokenizer import DetokenizeState, Tokenizer
@@ -54,7 +55,6 @@ logger = get_logger('lmdeploy')
 class VariableInterface:
     """A IO interface maintaining variables."""
     async_engine: AsyncEngine = None
-    session_id: int = 0
     api_keys: Optional[List[str]] = None
     request_hosts = []
     # following are for registering to proxy server
@@ -67,9 +67,26 @@ class VariableInterface:
     allow_terminate_by_client: bool = False
     enable_abort_handling: bool = False
 
+    @staticmethod
+    def get_session(session_id: int) -> int:
+        session_mgr = VariableInterface.get_session_manager()
+        if session_id == -1:
+            return session_mgr.get()
+        else:
+            return session_mgr.get(session_id)
+
+    @staticmethod
+    def get_session_manager():
+        return VariableInterface.async_engine.session_mgr
+
+    @staticmethod
+    def get_engine_config():
+        return VariableInterface.async_engine.backend_config
+
 
 router = APIRouter()
 get_bearer_token = HTTPBearer(auto_error=False)
+server_context = VariableInterface()
 
 
 async def check_api_key(auth: Optional[HTTPAuthorizationCredentials] = Depends(get_bearer_token), ) -> str:
@@ -128,21 +145,32 @@ def create_error_response(status: HTTPStatus, message: str, error_type='invalid_
                         status_code=status.value)
 
 
-async def check_request(request) -> Optional[JSONResponse]:
+def check_request(request) -> Optional[JSONResponse]:
     """Check if a request is valid."""
     if hasattr(request, 'model') and request.model not in get_model_list():
         return create_error_response(HTTPStatus.NOT_FOUND, f'The model {request.model!r} does not exist.')
-    if hasattr(request, 'n') and request.n <= 0:
-        return create_error_response(HTTPStatus.BAD_REQUEST, f'The n {request.n!r} must be a positive int.')
-    if hasattr(request, 'top_p') and not (request.top_p > 0 and request.top_p <= 1):
-        return create_error_response(HTTPStatus.BAD_REQUEST, f'The top_p {request.top_p!r} must be in (0, 1].')
-    if hasattr(request, 'top_k') and request.top_k < 0:
-        return create_error_response(HTTPStatus.BAD_REQUEST,
-                                     f'The top_k {request.top_k!r} cannot be a negative integer.')
-    if hasattr(request, 'temperature') and not (request.temperature <= 2 and request.temperature >= 0):
-        return create_error_response(HTTPStatus.BAD_REQUEST,
-                                     f'The temperature {request.temperature!r} must be in [0, 2]')
-    return
+
+    # Import the appropriate check function based on request type
+    if isinstance(request, ChatCompletionRequest):
+        from .serving_chat_completion import check_request
+        check_func = check_request
+    elif isinstance(request, CompletionRequest):
+        from .serving_completion import check_request
+        check_func = check_request
+    elif isinstance(request, GenerateReqInput):
+        from .serving_generate import check_request
+        check_func = check_request
+    else:
+        # Define an async function that always returns success
+        def always_success(req, server_context):
+            return ''
+
+        check_func = always_success
+
+    error_msg = check_func(request, server_context)
+    if error_msg:
+        return create_error_response(HTTPStatus.BAD_REQUEST, error_msg)
+    return None
 
 
 def _create_completion_logprobs(tokenizer: Tokenizer,
@@ -294,65 +322,88 @@ def logit_bias_logits_processor(logit_bias: Union[Dict[int, float], Dict[str, fl
 async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Request = None):
     """Completion API similar to OpenAI's API.
 
-    Refer to  `https://platform.openai.com/docs/api-reference/chat/create`
+    Refer to https://platform.openai.com/docs/api-reference/chat/create
     for the API specification.
 
     The request should be a JSON object with the following fields:
-    - model: model name. Available from /v1/models.
-    - messages: string prompt or chat history in OpenAI format. Chat history
-        example: `[{"role": "user", "content": "hi"}]`.
-    - temperature (float): to modulate the next token probability
-    - top_p (float): If set to float < 1, only the smallest set of most
-        probable tokens with probabilities that add up to top_p or higher
-        are kept for generation.
-    - n (int): How many chat completion choices to generate for each input
-        message. **Only support one here**.
-    - stream: whether to stream the results or not. Default to false.
-    - stream_options: Options for streaming response. Only set this when you
-        set stream: true.
-    - max_completion_tokens (int | None): output token nums. Default to None.
-    - max_tokens (int | None): output token nums. Default to None.
-        Deprecated: Use max_completion_tokens instead.
-    - repetition_penalty (float): The parameter for repetition penalty.
-        1.0 means no penalty
-    - stop (str | List[str] | None): To stop generating further
-        tokens. Only accept stop words that's encoded to one token idex.
-    - response_format (Dict | None): To generate response according to given
-        schema. Examples: `{"type": "json_schema", "json_schema": {"name":
-        "test","schema": {"properties": {"name": {"type": "string"}},
-        "required": ["name"], "type": "object"}}}`
-        or `{"type": "regex_schema", "regex_schema": "call me [A-Za-z]{1,10}"}`
-    - logit_bias (Dict): Bias to logits. Only supported in pytorch engine.
-    - tools (List): A list of tools the model may call. Currently, only
-        internlm2 functions are supported as a tool. Use this to specify a
-        list of functions for which the model can generate JSON inputs.
-    - tool_choice (str | object): Controls which (if any) tool is called by
-        the model. `none` means the model will not call any tool and instead
-        generates a message. Specifying a particular tool via {"type":
-        "function", "function": {"name": "my_function"}} forces the model to
-        call that tool. `auto` or `required` will put all the tools information
-        to the model.
+
+    - **model**: model name. Available from /v1/models.
+    - **messages**: string prompt or chat history in OpenAI format. Chat history example:
+      ``[{"role": "user", "content": "hi"}]``.
+    - **temperature** (float): to modulate the next token probability
+    - **top_p** (float): If set to float < 1, only the smallest set of most
+      probable tokens with probabilities that add up to top_p or higher
+      are kept for generation.
+    - **n** (int): How many chat completion choices to generate for each input
+      message. **Only support one here**.
+    - **stream**: whether to stream the results or not. Default to false.
+    - **stream_options**: Options for streaming response. Only set this when you
+      set stream: true.
+    - **max_completion_tokens** (int | None): output token nums. Default to None.
+    - **max_tokens** (int | None): output token nums. Default to None.
+      Deprecated: Use max_completion_tokens instead.
+    - **repetition_penalty** (float): The parameter for repetition penalty.
+      1.0 means no penalty
+    - **stop** (str | List[str] | None): To stop generating further
+      tokens. Only accept stop words that's encoded to one token idex.
+    - **response_format** (Dict | None): To generate response according to given
+      schema. Examples:
+
+      .. code-block:: json
+
+        {
+          "type": "json_schema",
+          "json_schema":{
+            "name": "test",
+            "schema":{
+              "properties":{
+                "name":{"type":"string"}
+              },
+              "required":["name"],
+              "type":"object"
+            }
+          }
+        }
+
+      or ``{"type": "regex_schema", "regex_schema": "call me [A-Za-z]{1,10}"}``
+    - **logit_bias** (Dict): Bias to logits. Only supported in pytorch engine.
+    - **tools** (List): A list of tools the model may call. Currently, only
+      internlm2 functions are supported as a tool. Use this to specify a
+      list of functions for which the model can generate JSON inputs.
+    - **tool_choice** (str | object): Controls which (if any) tool is called by
+      the model. `none` means the model will not call any tool and instead
+      generates a message. Specifying a particular tool via
+      ``{"type": "function", "function": {"name": "my_function"}}``
+      forces the model to call that tool. `auto` or `required` will put all
+      the tools informationto the model.
 
     Additional arguments supported by LMDeploy:
-    - top_k (int): The number of the highest probability vocabulary
-        tokens to keep for top-k-filtering
-    - ignore_eos (bool): indicator for ignoring eos
-    - skip_special_tokens (bool): Whether or not to remove special tokens
-        in the decoding. Default to be True.
-    - spaces_between_special_tokens (bool): Whether or not to add spaces
-        around special tokens. The behavior of Fast tokenizers is to have
-        this to False. This is setup to True in slow tokenizers.
-    - min_new_tokens (int): To generate at least numbers of tokens.
-    - min_p (float): Minimum token probability, which will be scaled by the
-        probability of the most likely token. It must be a value between
-        0 and 1. Typical values are in the 0.01-0.2 range, comparably
-        selective as setting `top_p` in the 0.99-0.8 range (use the
-        opposite of normal `top_p` values)
+
+    - **top_k** (int): The number of the highest probability vocabulary
+      tokens to keep for top-k-filtering
+    - **ignore_eos** (bool): indicator for ignoring eos
+    - **skip_special_tokens** (bool): Whether or not to remove special tokens
+      in the decoding. Default to be True.
+    - **spaces_between_special_tokens** (bool): Whether or not to add spaces
+      around special tokens. The behavior of Fast tokenizers is to have
+      this to False. This is setup to True in slow tokenizers.
+    - **min_new_tokens** (int): To generate at least numbers of tokens.
+    - **min_p** (float): Minimum token probability, which will be scaled by the
+      probability of the most likely token. It must be a value between
+      0 and 1. Typical values are in the 0.01-0.2 range, comparably
+      selective as setting `top_p` in the 0.99-0.8 range (use the
+      opposite of normal `top_p` values)
 
     Currently we do not support the following features:
-    - presence_penalty (replaced with repetition_penalty)
-    - frequency_penalty (replaced with repetition_penalty)
+
+    - **presence_penalty** (replaced with repetition_penalty)
+    - **frequency_penalty** (replaced with repetition_penalty)
     """
+    error_check_ret = check_request(request)
+    if error_check_ret is not None:
+        return error_check_ret
+    session = VariableInterface.get_session(request.session_id)
+
     json_request = await raw_request.json()
     migration_request = json_request.pop('migration_request', None)
     with_cache = json_request.pop('with_cache', False)
@@ -360,20 +411,11 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
 
-    if request.session_id == -1:
-        VariableInterface.session_id += 1
-        request.session_id = VariableInterface.session_id
-    error_check_ret = await check_request(request)
-    if error_check_ret is not None:
-        return error_check_ret
-    if VariableInterface.async_engine.id2step.get(request.session_id, 0) != 0:
-        return create_error_response(HTTPStatus.BAD_REQUEST, f'The session_id {request.session_id!r} is occupied.')
-
     model_name = request.model
     adapter_name = None
     if model_name != VariableInterface.async_engine.model_name:
         adapter_name = model_name  # got a adapter name
-    request_id = str(request.session_id)
+    request_id = str(session.session_id)
     created_time = int(time.time())
     gpt_oss_parser = None
     if VariableInterface.async_engine.arch == 'GptOssForCausalLM':
@@ -445,9 +487,18 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
                 tools = [item.function.model_dump() for item in request.tools]
     # text completion for string input
     do_preprocess = False if isinstance(request.messages, str) else request.do_preprocess
+    chat_template_kwargs = request.chat_template_kwargs or {}
+    if request.enable_thinking is not None:
+        logger.warning('`enable_thinking` will be deprecated in the future, '
+                       'please use `chat_template_kwargs` instead.')
+        if chat_template_kwargs.get('enable_thinking') is None:
+            chat_template_kwargs['enable_thinking'] = request.enable_thinking
+        else:
+            logger.warning('`enable_thinking` in `chat_template_kwargs` will override the value in request.')
+    enable_thinking = chat_template_kwargs.get('enable_thinking', None)
     result_generator = VariableInterface.async_engine.generate(
         request.messages,
-        request.session_id,
+        session,
         gen_config=gen_config,
         tools=tools,
         reasoning_effort=request.reasoning_effort,
@@ -456,8 +507,8 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         sequence_end=True,
         do_preprocess=do_preprocess,
         adapter_name=adapter_name,
-        enable_thinking=request.enable_thinking,
-    )
+        chat_template_kwargs=chat_template_kwargs or None,
+        mm_processor_kwargs=request.mm_processor_kwargs)
 
     def create_stream_response_json(index: int,
                                     delta_message: DeltaMessage,
@@ -494,7 +545,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
                                                             res.logprobs)
             # Only stream chunk `usage` in the final chunk according to OpenAI API spec
             if (res.finish_reason and request.stream_options and request.stream_options.include_usage):
-                total_tokens = sum([res.history_token_len, res.input_token_len, res.generate_token_len])
+                total_tokens = sum([res.input_token_len, res.generate_token_len])
                 usage = UsageInfo(
                     prompt_tokens=res.input_token_len,
                     completion_tokens=res.generate_token_len,
@@ -530,8 +581,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
                 elif (request.tool_choice != 'none' and request.tools is not None
                       and VariableInterface.tool_parser is None):
                     logger.error('Please launch the api_server with --tool-call-parser if you want to use tool.')
-
-                if VariableInterface.reasoning_parser is not None and request.enable_thinking is not False:
+                if VariableInterface.reasoning_parser is not None and enable_thinking is not False:
                     reasoning_delta = VariableInterface.reasoning_parser.extract_reasoning_content_streaming(
                         previous_text=previous_text,
                         current_text=current_text,
@@ -572,7 +622,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
     async for res in result_generator:
         if await raw_request.is_disconnected():
             # Abort the request if the client disconnects.
-            await VariableInterface.async_engine.stop_session(request.session_id)
+            await session.async_abort()
             return create_error_response(HTTPStatus.BAD_REQUEST, 'Client disconnected')
         final_res = res
         text += res.response
@@ -604,7 +654,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         elif request.tool_choice != 'none' and request.tools is not None and VariableInterface.tool_parser is None:
             logger.error('Please launch the api_server with --tool-call-parser if you want to use tool.')
 
-        if VariableInterface.reasoning_parser is not None and request.enable_thinking is not False:
+        if VariableInterface.reasoning_parser is not None and enable_thinking is not False:
             reasoning_content, text = VariableInterface.reasoning_parser.extract_reasoning_content(text, request)
 
         message = ChatMessage(role='assistant',
@@ -633,7 +683,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         cache_block_ids = cache_block_ids[0]
         remote_token_ids = [remote_token_ids[0][-1]]
 
-    total_tokens = sum([final_res.history_token_len, final_res.input_token_len, final_res.generate_token_len])
+    total_tokens = sum([final_res.input_token_len, final_res.generate_token_len])
     usage = UsageInfo(
         prompt_tokens=final_res.input_token_len,
         completion_tokens=final_res.generate_token_len,
@@ -658,51 +708,58 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
 async def completions_v1(request: CompletionRequest, raw_request: Request = None):
     """Completion API similar to OpenAI's API.
 
-    Go to `https://platform.openai.com/docs/api-reference/completions/create`
+    Go to https://platform.openai.com/docs/api-reference/completions/create
     for the API specification.
 
     The request should be a JSON object with the following fields:
-    - model (str): model name. Available from /v1/models.
-    - prompt (str): the input prompt.
-    - suffix (str): The suffix that comes after a completion of inserted text.
-    - max_completion_tokens (int | None): output token nums. Default to None.
-    - max_tokens (int | None): output token nums. Default to 16.
-        Deprecated: Use max_completion_tokens instead.
-    - temperature (float): to modulate the next token probability
-    - top_p (float): If set to float < 1, only the smallest set of most
-        probable tokens with probabilities that add up to top_p or higher
-        are kept for generation.
-    - n (int): How many chat completion choices to generate for each input
-        message. **Only support one here**.
-    - stream: whether to stream the results or not. Default to false.
-    - stream_options: Options for streaming response. Only set this when you
-        set stream: true.
-    - repetition_penalty (float): The parameter for repetition penalty.
-        1.0 means no penalty
-    - user (str): A unique identifier representing your end-user.
-    - stop (str | List[str] | None): To stop generating further
-        tokens. Only accept stop words that's encoded to one token idex.
+
+    - **model** (str): model name. Available from /v1/models.
+    - **prompt** (str): the input prompt.
+    - **suffix** (str): The suffix that comes after a completion of inserted text.
+    - **max_completion_tokens** (int | None): output token nums. Default to None.
+    - **max_tokens** (int | None): output token nums. Default to 16.
+      Deprecated: Use max_completion_tokens instead.
+    - **temperature** (float): to modulate the next token probability
+    - **top_p** (float): If set to float < 1, only the smallest set of most
+      probable tokens with probabilities that add up to top_p or higher
+      are kept for generation.
+    - **n** (int): How many chat completion choices to generate for each input
+      message. **Only support one here**.
+    - **stream**: whether to stream the results or not. Default to false.
+    - **stream_options**: Options for streaming response. Only set this when you
+      set stream: true.
+    - **repetition_penalty** (float): The parameter for repetition penalty.
+      1.0 means no penalty
+    - **user** (str): A unique identifier representing your end-user.
+    - **stop** (str | List[str] | None): To stop generating further
+      tokens. Only accept stop words that's encoded to one token idex.
 
     Additional arguments supported by LMDeploy:
-    - ignore_eos (bool): indicator for ignoring eos
-    - skip_special_tokens (bool): Whether or not to remove special tokens
-        in the decoding. Default to be True.
-    - spaces_between_special_tokens (bool): Whether or not to add spaces
-        around special tokens. The behavior of Fast tokenizers is to have
-        this to False. This is setup to True in slow tokenizers.
-    - top_k (int): The number of the highest probability vocabulary
-        tokens to keep for top-k-filtering
-    - min_p (float): Minimum token probability, which will be scaled by the
-        probability of the most likely token. It must be a value between
-        0 and 1. Typical values are in the 0.01-0.2 range, comparably
-        selective as setting `top_p` in the 0.99-0.8 range (use the
-        opposite of normal `top_p` values)
+
+    - **ignore_eos** (bool): indicator for ignoring eos
+    - **skip_special_tokens** (bool): Whether or not to remove special tokens
+      in the decoding. Default to be True.
+    - **spaces_between_special_tokens** (bool): Whether or not to add spaces
+      around special tokens. The behavior of Fast tokenizers is to have
+      this to False. This is setup to True in slow tokenizers.
+    - **top_k** (int): The number of the highest probability vocabulary
+      tokens to keep for top-k-filtering
+    - **min_p** (float): Minimum token probability, which will be scaled by the
+      probability of the most likely token. It must be a value between
+      0 and 1. Typical values are in the 0.01-0.2 range, comparably
+      selective as setting `top_p` in the 0.99-0.8 range (use the
+      opposite of normal `top_p` values)
 
     Currently we do not support the following features:
-    - logprobs (not supported yet)
-    - presence_penalty (replaced with repetition_penalty)
-    - frequency_penalty (replaced with repetition_penalty)
+
+    - **logprobs** (not supported yet)
+    - **presence_penalty** (replaced with repetition_penalty)
+    - **frequency_penalty** (replaced with repetition_penalty)
     """
+    error_check_ret = check_request(request)
+    if error_check_ret is not None:
+        return error_check_ret
+
     json_request = await raw_request.json()
     migration_request = json_request.pop('migration_request', None)
     with_cache = json_request.pop('with_cache', False)
@@ -710,23 +767,19 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
 
-    if request.session_id == -1:
-        VariableInterface.session_id += 1
-        request.session_id = VariableInterface.session_id
-    error_check_ret = await check_request(request)
-    if error_check_ret is not None:
-        return error_check_ret
-    if VariableInterface.async_engine.id2step.get(request.session_id, 0) != 0:
-        return create_error_response(HTTPStatus.BAD_REQUEST, f'The session_id {request.session_id!r} is occupied.')
-
     model_name = request.model
     adapter_name = None
     if model_name != VariableInterface.async_engine.model_name:
         adapter_name = model_name  # got a adapter name
     request_id = str(request.session_id)
     created_time = int(time.time())
+    sessions = []
     if isinstance(request.prompt, str):
         request.prompt = [request.prompt]
+        sessions.append(VariableInterface.get_session(request.session_id))
+    elif isinstance(request.prompt, list):
+        for i in range(len(request.prompt)):
+            sessions.append(VariableInterface.get_session(i + 1))
     if isinstance(request.stop, str):
         request.stop = [request.stop]
     random_seed = request.seed if request.seed else None
@@ -751,10 +804,10 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
         preserve_cache=preserve_cache,
     )
     generators = []
-    for i in range(len(request.prompt)):
+    for prompt, session in zip(request.prompt, sessions):
         result_generator = VariableInterface.async_engine.generate(
-            request.prompt[i],
-            request.session_id + i,
+            prompt,
+            session,
             gen_config=gen_config,
             stream_response=True,  # always use stream to enable batching
             sequence_start=True,
@@ -801,8 +854,7 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
                 # Only stream chunk `usage` in the final chunk according to OpenAI API spec
                 if (res.finish_reason and request.stream_options and request.stream_options.include_usage):
                     final_res = res
-                    total_tokens = sum(
-                        [final_res.history_token_len, final_res.input_token_len, final_res.generate_token_len])
+                    total_tokens = sum([final_res.input_token_len, final_res.generate_token_len])
                     usage = UsageInfo(
                         prompt_tokens=final_res.input_token_len,
                         completion_tokens=final_res.generate_token_len,
@@ -874,7 +926,7 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
             cache_block_ids = cache_block_ids[0]
             remote_token_ids = [remote_token_ids[0][-1]]
 
-        total_tokens = sum([final_res.history_token_len, final_res.input_token_len, final_res.generate_token_len])
+        total_tokens = sum([final_res.input_token_len, final_res.generate_token_len])
         usage.prompt_tokens += final_res.input_token_len
         usage.completion_tokens += final_res.generate_token_len
         usage.total_tokens += total_tokens
@@ -898,17 +950,10 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
 
 @router.post('/generate', dependencies=[Depends(check_api_key)])
 async def generate(request: GenerateReqInput, raw_request: Request = None):
-
-    if request.session_id == -1:
-        VariableInterface.session_id += 1
-        request.session_id = VariableInterface.session_id
-    error_check_ret = await check_request(request)
+    error_check_ret = check_request(request)
     if error_check_ret is not None:
         return error_check_ret
-    if VariableInterface.async_engine.id2step.get(request.session_id, 0) != 0:
-        return create_error_response(HTTPStatus.BAD_REQUEST, f'The session_id `{request.session_id}` is occupied.')
-    if (request.prompt is not None) ^ (request.input_ids is None):
-        return create_error_response(HTTPStatus.BAD_REQUEST, 'You must specify exactly one of prompt or input_ids')
+    session = VariableInterface.get_session(request.session_id)
 
     prompt = request.prompt
     input_ids = request.input_ids
@@ -942,36 +987,47 @@ async def generate(request: GenerateReqInput, raw_request: Request = None):
         skip_special_tokens=request.skip_special_tokens,
         spaces_between_special_tokens=request.spaces_between_special_tokens,
         include_stop_str_in_output=request.include_stop_str_in_output,
+        return_routed_experts=request.return_routed_experts,
     )
 
     result_generator = VariableInterface.async_engine.generate(
         messages=prompt,
-        session_id=request.session_id,
+        session_id=session,
         input_ids=input_ids,
         gen_config=gen_config,
         stream_response=True,  # always use stream to enable batching
         sequence_start=True,
         sequence_end=True,
         do_preprocess=False,
-    )
+        mm_processor_kwargs=request.mm_processor_kwargs)
 
-    def create_generate_response_json(res, text, output_ids, logprobs, finish_reason):
+    def create_generate_response_json(res, text, output_ids, logprobs, finish_reason, routed_experts=None):
+        # only output router experts in last chunk
+        routed_experts = None if finish_reason is None else routed_experts
         meta = GenerateReqMetaOutput(finish_reason=dict(type=finish_reason) if finish_reason else None,
                                      output_token_logprobs=logprobs or None,
                                      prompt_tokens=res.input_token_len,
+                                     routed_experts=routed_experts,
                                      completion_tokens=res.generate_token_len)
-        response = GenerateReqOutput(text=text, output_ids=output_ids, meta_info=meta)
+
+        response = GenerateReqOutput(text=text, output_ids=output_ids, meta_info=meta, routed_experts=routed_experts)
         return response.model_dump_json()
 
     async def generate_stream_generator():
         async for res in result_generator:
             text = res.response or ''
             output_ids = res.token_ids
+            routed_experts = res.routed_experts
             logprobs = []
             if res.logprobs:
                 for tok, tok_logprobs in zip(res.token_ids, res.logprobs):
                     logprobs.append((tok_logprobs[tok], tok))
-            response_json = create_generate_response_json(res, text, output_ids, logprobs, res.finish_reason)
+            response_json = create_generate_response_json(res,
+                                                          text,
+                                                          output_ids,
+                                                          logprobs,
+                                                          res.finish_reason,
+                                                          routed_experts=routed_experts)
             yield f'data: {response_json}\n\n'
         yield 'data: [DONE]\n\n'
 
@@ -987,7 +1043,7 @@ async def generate(request: GenerateReqInput, raw_request: Request = None):
         async for res in result_generator:
             if await raw_request.is_disconnected():
                 # Abort the request if the client disconnects.
-                await VariableInterface.async_engine.stop_session(request.session_id)
+                await session.async_abort()
                 return create_error_response(HTTPStatus.BAD_REQUEST, 'Client disconnected')
             text += res.response or ''
             output_ids.extend(res.token_ids or [])
@@ -998,6 +1054,7 @@ async def generate(request: GenerateReqInput, raw_request: Request = None):
         meta = GenerateReqMetaOutput(finish_reason=dict(type=res.finish_reason) if res.finish_reason else None,
                                      output_token_logprobs=logprobs or None,
                                      prompt_tokens=res.input_token_len,
+                                     routed_experts=res.routed_experts,
                                      completion_tokens=res.generate_token_len)
         response = GenerateReqOutput(text=text, output_ids=output_ids, meta_info=meta)
 
@@ -1016,10 +1073,11 @@ async def encode(request: EncodeRequest, raw_request: Request = None):
     """Encode prompts.
 
     The request should be a JSON object with the following fields:
-    - input: the prompt to be encoded. In str or List[str] format.
-    - do_preprocess: whether do preprocess or not. Default to False.
-    - add_bos: True when it is the beginning of a conversation. False when it
-        is not. Default to True.
+
+    - **input**: the prompt to be encoded. In str or List[str] format.
+    - **do_preprocess**: whether do preprocess or not. Default to False.
+    - **add_bos**: True when it is the beginning of a conversation. False when it
+      is not. Default to True.
     """
 
     def encode(prompt: str, do_preprocess: bool, add_bos: bool):
@@ -1051,8 +1109,9 @@ async def pooling(request: PoolingRequest, raw_request: Request = None):
     for the Embeddings API specification.
 
     The request should be a JSON object with the following fields:
-    - model (str): model name. Available from /v1/models.
-    - input (List[int] | List[List[int]] | str | List[str]): input text to be embed
+
+    - **model** (str): model name. Available from /v1/models.
+    - **input** (List[int] | List[List[int]] | str | List[str]): input text to be embed
     """
 
     async_engine = VariableInterface.async_engine
@@ -1077,7 +1136,7 @@ async def pooling(request: PoolingRequest, raw_request: Request = None):
     else:
         return create_error_response(HTTPStatus.BAD_REQUEST, 'Input must be a string or a list.')
 
-    batch_scores = await async_engine._async_get_reward_score(input_ids)
+    batch_scores = await async_engine.async_get_reward_score(input_ids)
     prompt_tokens = sum(len(ids) for ids in input_ids)
     usage = UsageInfo(prompt_tokens=prompt_tokens, completion_tokens=0, total_tokens=prompt_tokens)
 
@@ -1176,12 +1235,13 @@ async def abort_request(request: AbortRequest, raw_request: Request = None):
     if request.abort_all:
         await VariableInterface.async_engine.stop_all_session()
     else:
-        await VariableInterface.async_engine.stop_session(request.session_id)
+        session = VariableInterface.get_session(request.session_id)
+        await session.async_abort()
     return Response(status_code=200)
 
 
-@router.post('/v1/chat/interactive', dependencies=[Depends(check_api_key)])
-async def chat_interactive_v1(request: GenerateRequest, raw_request: Request = None):
+@router.post('/v1/chat/interactive', dependencies=[Depends(check_api_key)], include_in_schema=False)
+async def chat_interactive_v1(request, raw_request: Request = None):
     return create_error_response(
         HTTPStatus.BAD_REQUEST, 'v1/chat/interactive is deprecated, please launch server with --enable-prefix-cache '
         'and use /v1/chat/completions instead.')
@@ -1203,9 +1263,12 @@ def handle_torchrun():
 @router.on_event('startup')
 async def startup_event():
     async_engine = VariableInterface.async_engine
-    async_engine.start_loop(use_async_api=True)
+    async_engine.start_loop(asyncio.get_running_loop(), use_async_api=True)
 
     if VariableInterface.proxy_url is None:
+        return
+    elif getattr(async_engine.engine, 'is_dummy', False):
+        logger.info('Dummy node started')
         return
     try:
         import requests
@@ -1305,10 +1368,9 @@ def create_lifespan_handler(backend_config: Union[PytorchEngineConfig, Turbomind
                     while True:
                         await asyncio.sleep(log_interval)
 
-                        # Since scheduled metrics is not changed as frequently as iteration statistics,
-                        # we conduct its statistics every `log_interval` seconds
+                        # periodically update schedule metrics, as they change less frequently than iteration stats
                         schedule_metrics = async_engine.get_schedule_metrics()
-                        await metrics_processor.udpate_schedule_stats(schedule_metrics)
+                        await metrics_processor.update_schedule_stats(schedule_metrics)
 
                         await async_engine.do_log_stats()
 
@@ -1345,6 +1407,7 @@ def serve(model_path: str,
           tool_call_parser: Optional[str] = None,
           allow_terminate_by_client: bool = False,
           enable_abort_handling: bool = False,
+          speculative_config: Optional[SpeculativeConfig] = None,
           **kwargs):
     """An example to perform model inference through the command line
     interface.
@@ -1418,12 +1481,16 @@ def serve(model_path: str,
     _, pipeline_class = get_task(model_path)
     if isinstance(backend_config, PytorchEngineConfig):
         backend_config.enable_mp_engine = True
+        # router replay
+        if backend_config.enable_return_routed_experts:
+            backend_config.enable_transfer_obj_ref = True
     VariableInterface.async_engine = pipeline_class(model_path=model_path,
                                                     model_name=model_name,
                                                     backend=backend,
                                                     backend_config=backend_config,
                                                     chat_template_config=chat_template_config,
                                                     max_log_len=max_log_len,
+                                                    speculative_config=speculative_config,
                                                     **kwargs)
     # set reasoning parser and tool parser
     set_parsers(reasoning_parser, tool_call_parser)
@@ -1465,7 +1532,8 @@ def serve(model_path: str,
                 port=server_port,
                 log_level=os.getenv('UVICORN_LOG_LEVEL', 'info').lower(),
                 ssl_keyfile=ssl_keyfile,
-                ssl_certfile=ssl_certfile)
+                ssl_certfile=ssl_certfile,
+                timeout_keep_alive=int(os.environ.get('UVICORN_TIMEOUT_KEEP_ALIVE', 5)))
 
 
 if __name__ == '__main__':

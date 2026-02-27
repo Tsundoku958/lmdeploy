@@ -1,8 +1,10 @@
 accelerate>=0.29.3
 aiohttp
+cloudpickle
 einops
 fastapi
 fire
+flash-linear-attention
 mmengine-lite
 numpy
 openai
@@ -12,17 +14,18 @@ peft<=0.14.0
 pillow
 prometheus_client
 protobuf
+pybase64
 pydantic>2.0.0
-pynvml
 pyzmq
 ray
 safetensors
 sentencepiece
 shortuuid
 tiktoken
+tilelang
 torch<=2.8.0,>=2.0.0
 torchvision<=0.23.0,>=0.15.0
-transformers
+transformers<5.0.0
 triton<=3.4.0,>=3.0.0; sys_platform == "linux" and "aarch64" not in platform_machine and "arm" not in platform_machine
 uvicorn
 xgrammar

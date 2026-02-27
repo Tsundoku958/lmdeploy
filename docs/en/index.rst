@@ -80,6 +80,7 @@ Documentation
    quantization/w4a16.md
    quantization/w8a8.md
    quantization/kv_quant.md
+   quantization/llm_compressor.md
 
 .. _benchmark:
 .. toctree::
@@ -88,6 +89,7 @@ Documentation
 
    benchmark/benchmark.md
    benchmark/evaluate_with_opencompass.md
+   benchmark/evaluate_with_vlmevalkit.md
 
 .. toctree::
    :maxdepth: 1
@@ -103,15 +105,21 @@ Documentation
    advance/pytorch_multinodes.md
    advance/pytorch_profiling.md
    advance/metrics.md
+   advance/context_parallel.md
+   advance/spec_decoding.md
+   advance/update_weights.md
 
 .. toctree::
    :maxdepth: 1
    :caption: API Reference
 
    api/pipeline.rst
+   api/openapi.rst
+   api/cli.rst
 
 Indices and tables
 ==================
 
 * :ref:`genindex`
 * :ref:`search`
+* :ref:`routingtable`

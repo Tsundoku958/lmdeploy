@@ -4,8 +4,25 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 
+from lmdeploy.pytorch.config import QuantizationConfig
 from lmdeploy.pytorch.engine.input_process import BaseModelInputProcessor
-from lmdeploy.pytorch.model_inputs import StepContext
+from lmdeploy.pytorch.model_inputs import ModelInputs, ModelInputsDelta, StepContext
+
+
+class BaseModelMetaProcessor:
+    """Model meta processor base class."""
+
+    def update_inputs(self, inputs: ModelInputs, device: torch.device) -> ModelInputs:
+        """Update model inputs."""
+        return inputs
+
+    def update_delta(self, inputs: ModelInputs, delta: ModelInputsDelta) -> ModelInputs:
+        """Update model inputs for delta."""
+        return inputs
+
+    def merge(self, inputs: ModelInputs, other: ModelInputs) -> ModelInputs:
+        """Merge model inputs with deltas."""
+        return inputs
 
 
 class DeployModelMixin:
@@ -31,7 +48,8 @@ class DeployModelMixin:
         """Compute logits of the model output."""
         return hidden_states
 
-    def rename_weight(self, name: str) -> str:
+    @classmethod
+    def rename_weight(cls, name: str) -> str:
         """Rename weight."""
         return name
 
@@ -49,6 +67,43 @@ class DeployModelMixin:
     def get_input_processor(self) -> BaseModelInputProcessor:
         """Get input processor."""
         return None
+
+    def get_modelmeta_processor(self) -> BaseModelMetaProcessor:
+        """Get model meta preprocessor."""
+        return BaseModelMetaProcessor()
+
+    @classmethod
+    def update_quant_config(cls, quant_config: QuantizationConfig):
+        """Update quant config."""
+        if quant_config is None:
+            return
+        ignored_layers = [cls.rename_weight(name) for name in quant_config.ignored_layers]
+
+        added_ignore_layers = set()
+
+        for layer_name in ignored_layers:
+            if '.q_proj' in layer_name:
+                added_ignore_layers.add(layer_name.replace(
+                    '.q_proj',
+                    '.qkv_proj',
+                ))
+            elif '.gate_proj' in layer_name:
+                if '.experts' in layer_name:
+                    added_ignore_layers.add(layer_name.split('.experts', 1)[0] + '.experts')
+                else:
+                    added_ignore_layers.add(layer_name.replace('.gate_proj', '.gate_up_proj'))
+            elif '.down_proj' in layer_name:
+                if '.experts' in layer_name:
+                    added_ignore_layers.add(layer_name.split('.experts', 1)[0] + '.experts')
+                else:
+                    added_ignore_layers.add(layer_name.replace('.down_proj', '.down_proj'))
+
+        added_ignore_layers = list(added_ignore_layers)
+
+        ignored_layers.extend(added_ignore_layers)
+        quant_config.ignored_layers = ignored_layers
+
+        return quant_config
 
 
 def vlm_model(vlm_cls):

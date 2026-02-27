@@ -99,6 +99,19 @@ def get_chat_template(chat_template: str, model_path: str = None):
         return None
 
 
+def get_speculative_config(args):
+    """Get speculative config from args."""
+    from lmdeploy.messages import SpeculativeConfig
+    speculative_config = None
+    if args.speculative_algorithm is not None:
+        speculative_config = SpeculativeConfig(
+            method=args.speculative_algorithm,
+            model=args.speculative_draft_model,
+            num_speculative_tokens=args.speculative_num_draft_tokens,
+        )
+    return speculative_config
+
+
 class ArgumentHelper:
     """Helper class to add unified argument."""
 
@@ -189,6 +202,16 @@ class ArgumentHelper:
                                    help='expert parallelism. dp is required when pytorch engine is used.')
 
     @staticmethod
+    def cp(parser):
+        """Add argument cp to parser."""
+
+        return parser.add_argument(
+            '--cp',
+            type=int,
+            default=1,
+            help='context parallelism size in attention for turbomind backend, tp must be a multiple of cp.')
+
+    @staticmethod
     def dp_rank(parser):
         """Add argument dp_rank to parser."""
 
@@ -208,6 +231,12 @@ class ArgumentHelper:
         """Add argument num_nodes to parser."""
 
         return parser.add_argument('--nnodes', type=int, default=1, help='The total node nums')
+
+    @staticmethod
+    def dist_init_addr(parser):
+        """Add argument dist_init_addr to parser."""
+
+        return parser.add_argument('--dist-init-addr', type=str, default=None)
 
     @staticmethod
     def session_id(parser):
@@ -359,7 +388,12 @@ class ArgumentHelper:
     def calib_dataset(parser):
         """Add argument calib_dataset to parser."""
 
-        return parser.add_argument('--calib-dataset', type=str, default='ptb', help='The calibration dataset name')
+        return parser.add_argument(
+            '--calib-dataset',
+            type=str,
+            default='wikitext2',
+            choices=['wikitext2', 'c4', 'pileval', 'gsm8k', 'neuralmagic_calibration', 'open-platypus', 'openwebtext'],
+            help='The calibration dataset name.')
 
     @staticmethod
     def calib_samples(parser):
@@ -534,6 +568,16 @@ class ArgumentHelper:
                                    help='the max number of forward passes in prefill stage')
 
     @staticmethod
+    def async_(parser):
+        return parser.add_argument('--async',
+                                   type=int,
+                                   default=1,
+                                   choices=[0, 1],
+                                   dest='async_',
+                                   help='Enable async execution (default: 1, enabled). '
+                                   'Set to 0 to disable async mode, 1 to enable it.')
+
+    @staticmethod
     def max_prefill_token_num(parser):
         return parser.add_argument('--max-prefill-token-num',
                                    type=int,
@@ -666,6 +710,45 @@ class ArgumentHelper:
                                    type=float,
                                    default=0.85,
                                    help='The confidence threshold for dllm.')
+
+    @staticmethod
+    def enable_return_routed_experts(parser):
+        """Add argument return routed experts to parser."""
+
+        return parser.add_argument('--enable-return-routed-experts',
+                                   action='store_true',
+                                   default=False,
+                                   help='Whether to output routed expert ids for replay')
+
+    @staticmethod
+    def add_spec_group(parser):
+        spec_group = parser.add_argument_group('Speculative decoding arguments')
+        spec_group.add_argument('--speculative-algorithm',
+                                type=str,
+                                default=None,
+                                choices=['eagle', 'eagle3', 'deepseek_mtp'],
+                                help='The speculative algorithm to use. `None` means speculative decoding is disabled')
+
+        spec_group.add_argument('--speculative-draft-model',
+                                type=str,
+                                default=None,
+                                help='The path to speculative draft model')
+
+        spec_group.add_argument('--speculative-num-draft-tokens',
+                                type=int,
+                                default=1,
+                                help='The number of speculative tokens to generate per step')
+
+        return spec_group
+
+    @staticmethod
+    def distributed_executor_backend(parser):
+        """Distributed_executor_backend."""
+        return parser.add_argument('--distributed-executor-backend',
+                                   type=str,
+                                   default=None,
+                                   choices=['uni', 'mp', 'ray'],
+                                   help='The distributed executor backend for pytorch engine.')
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/utils/__init__.py

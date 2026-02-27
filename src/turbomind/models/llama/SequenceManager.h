@@ -5,6 +5,7 @@
 #include <functional>
 
 #include "src/turbomind/core/allocator.h"
+#include "src/turbomind/core/core.h"
 
 #include "src/turbomind/models/llama/BlockManager.h"
 #include "src/turbomind/models/llama/BlockTrie.h"
@@ -40,8 +41,8 @@ struct Sequence {
     mutable float rope_theta = 0.f;
 
     // embedding data
-    mutable std::vector<std::vector<std::byte>> input_embeddings;
-    mutable std::vector<std::pair<int, int>>    input_embedding_ranges;
+    mutable std::vector<Tensor> input_embeds;
+    mutable std::vector<int>    input_embeds_offsets;
 
     explicit Sequence(uint64_t _id): id(_id) {}
 
@@ -81,6 +82,7 @@ public:
                              int                chunk_size,
                              bool               enable_prefix_caching,
                              int                rank,
+                             int                attn_cp_size,
                              core::Allocator    allocator,
                              GetFreeMemSize     get_free_size);
 
@@ -105,11 +107,20 @@ public:
 
     using AdjustInputCount = std::function<int(const Sequences&, const std::vector<int>&)>;
 
-    [[nodiscard]] Outcome Materialize(Sequences                    sequences,
-                                      std::vector<int>             context_lengths,
-                                      const std::vector<uint64_t>& priorities,
-                                      int                          step_length,
-                                      AdjustInputCount             adjust);
+    //                50       1       0       50
+    //    context = seq_len + beta = cache + alpha + input
+    //     alpha' = input
+    //      beta' = int(is_gen)
+    //  -----------------------------------
+    //   seq_len += output
+    //     cache += input + output - 1  or  cache = seq_len - 1
+
+    [[maybe_unused]] Outcome Materialize(Sequences             sequences,
+                                         std::vector<int>      context_length,
+                                         std::vector<int>      alpha,
+                                         std::vector<uint64_t> priorities,
+                                         int                   max_fwd_tokens,
+                                         int                   max_tmp_tokens);
 
     /** @brief cache the input prompt tokens of each seq in sequences[0:active_size-1]
      *
@@ -169,23 +180,19 @@ private:
     void VerifyAndLockCached(const Sequences& sequences);
 
     std::vector<int> CountRequiredBlocks(const Sequences&        sequences,  //
-                                         const std::vector<int>& context_lengths,
-                                         int                     step_length);
-
-    static void SortByPriority(Sequences&                   sequences,  //
-                               std::vector<int>&            context_lengths,
-                               const std::vector<uint64_t>& priorities);
+                                         const std::vector<int>& context_length);
 
     static void AssignAndActivate(const Sequences&        sequences,  //
                                   const std::vector<int>& counts,
                                   const BlockIds&         blocks,
                                   const UniqueIds&        unique_ids);
 
-    void PrefixMatch(Sequences& sequences);
+    void PrefixMatch(Sequences& sequences, const std::vector<int>& alpha);
 
 private:
     int block_seq_len_;
     int rank_;
+    int attn_cp_size_;
 
     // Use `std::map` to avoid reference invalidation
     std::map<uint64_t, Sequence> sequences_;
