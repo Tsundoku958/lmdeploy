@@ -1117,6 +1117,14 @@ class BaseModelAgent:
             self.spec_agent.build_cache_engine(self.cache_stream)
 
     def _forward_impl(self, inputs: ModelInputs):
+        print("inputs.block_offsets", inputs.block_offsets)
+        ori_block_offesets = inputs.block_offsets.detach().clone()
+        device = inputs.block_offsets.device
+        # inputs.block_offsets = torch.tensor([[1,2]], device=device, dtype=torch.int32)
+        # block_size 128 kernel_block_size 32
+        block_num = inputs.block_offsets.shape[1]
+        inputs.block_offsets = (torch.arange(block_num*4)+1).to(device).to(torch.int32).reshape(1,-1)
+        print("after inputs.block_offsets", inputs.block_offsets)
         output = model_forward(
             self.patched_model,
             inputs,
@@ -1124,6 +1132,7 @@ class BaseModelAgent:
             state_cache_engine=self.state_cache_engine,
             stream=self.stream,
         )
+        inputs.block_offsets = ori_block_offesets
         return output
 
     async def async_forward(self, inputs: ModelInputs):
