@@ -1112,7 +1112,9 @@ class BaseModelAgent:
                                             tp_rank=dist_ctx.attn_tp_group.rank,
                                             world_size=tp,
                                             cache_stream=self.cache_stream)
-            self.state_cache_engine = StateCacheEngine(self.cache_config)
+            mem_pool = self.cache_engine.full_gpu_cache
+
+            self.state_cache_engine = StateCacheEngine(self.cache_config, mem_pool=mem_pool)
 
             self.spec_agent.build_cache_engine(self.cache_stream)
 

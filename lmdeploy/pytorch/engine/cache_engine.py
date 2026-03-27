@@ -253,25 +253,29 @@ class CacheEngine:
         return descs
 
     @classmethod
-    def allocate_caches(cls, num_blocks: int, model_config: ModelConfig, cache_config: CacheConfig, world_size: int,
-                        device: str):
-        """Allocate caches."""
-
-        num_layers = model_config.num_layers
-        kernel_blocks_per_kv = cache_config.block_size // cache_config.kernel_block_size
-        num_blocks *= kernel_blocks_per_kv
-
-        # get all descs
+    def get_all_cache_descs_and_pool_size(cls, model_config: ModelConfig, cache_config: CacheConfig,
+                                          world_size: int) -> Tuple[List[CacheDesc], int]:
+        """Get all cache descs."""
         k_cache_desc = cls.get_k_cache_desc(model_config, cache_config, world_size)
         v_cache_desc = cls.get_v_cache_desc(model_config, cache_config, world_size)
         quant_cache_descs = cls.get_quant_cache_descs(k_cache_desc, v_cache_desc, model_config, cache_config)
         custom_cache_descs = cls.get_custom_cache_descs(model_config, cache_config)
         cache_descs = [k_cache_desc, v_cache_desc] + quant_cache_descs + custom_cache_descs
-
-        # get mempool size
         mem_pool_size = 0
         for desc in cache_descs:
             mem_pool_size += desc.aligned_size
+        return cache_descs, mem_pool_size
+
+    @classmethod
+    def allocate_caches(cls, num_blocks: int, model_config: ModelConfig, cache_config: CacheConfig, world_size: int,
+                        device: str):
+        """Allocate caches."""
+        num_layers = model_config.num_layers
+        kernel_blocks_per_kv = cache_config.block_size // cache_config.kernel_block_size
+        num_blocks *= kernel_blocks_per_kv
+
+        # get all descs and mem pool size
+        cache_descs, mem_pool_size = cls.get_all_cache_descs_and_pool_size(model_config, cache_config, world_size)
 
         # create pool
         mem_pool = torch.zeros((num_layers, num_blocks, mem_pool_size), dtype=torch.uint8, device=device)
@@ -461,11 +465,21 @@ class CacheEngine:
 class StateCacheEngine:
     """Cache engine for state cache."""
 
-    def __init__(self, cache_config: CacheConfig):
+    def __init__(self, cache_config: CacheConfig, mem_pool: Optional[torch.Tensor] = None):
+        if mem_pool is not None:
+            self.mem_pool = mem_pool
         self.cache_config = cache_config
         self.mem_pool, self._state_caches = self.allocate_caches(num_caches=cache_config.num_state_caches,
                                                                  state_shapes=cache_config.states_shapes,
                                                                  device='cuda')
+
+    @staticmethod
+    def get_state_cache_descs_and_pool_size(
+            state_shapes: List[Tuple[Tuple[int], torch.dtype]]) -> Tuple[List[CacheDesc], int]:
+        """Get state cache descs and total pool size."""
+        cache_descs = [CacheDesc(shape, dtype) for shape, dtype in state_shapes]
+        mem_pool_size = sum(desc.aligned_size for desc in cache_descs)
+        return cache_descs, mem_pool_size
 
     @staticmethod
     def allocate_caches(num_caches: int, state_shapes: List[Tuple[Tuple[int], torch.dtype]], device: torch.device):
@@ -474,12 +488,7 @@ class StateCacheEngine:
         if len(state_shapes) == 0 or num_caches == 0:
             return torch.empty((0, 0), dtype=torch.uint8, device=device), []
 
-        cache_descs = [CacheDesc(shape, dtype) for shape, dtype in state_shapes]
-
-        # get mempool size
-        mem_pool_size = 0
-        for desc in cache_descs:
-            mem_pool_size += desc.aligned_size
+        cache_descs, mem_pool_size = StateCacheEngine.get_state_cache_descs_and_pool_size(state_shapes)
 
         # create pool
         mem_pool = torch.zeros((num_caches, mem_pool_size), dtype=torch.uint8, device=device)

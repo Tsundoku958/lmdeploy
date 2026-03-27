@@ -50,6 +50,7 @@ class Scheduler:
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
+        print('block size schedule', self.cache_config.block_size)
         self.sessions: Dict[int, SchedulerSession] = OrderedDict()
 
         # For Disaggregation

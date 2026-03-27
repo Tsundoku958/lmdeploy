@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from lmdeploy.pytorch.config import BackendConfig, CacheConfig, DistConfig, MiscConfig, ModelConfig, SpecDecodeConfig
 from lmdeploy.pytorch.disagg.conn.protocol import DistServeInitRequest, DistServeKVTransferEndpointInfo
 from lmdeploy.pytorch.disagg.messages import MigrationExecutionBatch
-from lmdeploy.pytorch.engine.cache_engine import CacheEngine
+from lmdeploy.pytorch.engine.cache_engine import CacheEngine, StateCacheEngine
 from lmdeploy.utils import get_logger
 
 logger = get_logger('lmdeploy')
@@ -158,6 +158,19 @@ class ExecutorBase:
                 f'Update `block_size={self.cache_config.block_size}` for large `head_dim={self.model_config.k_head_dim}`.'  # noqa
             )
 
+        if len(self.cache_config.states_shapes) > 0:
+            tp = self.dist_config.attn_tp
+            _, kv_mem_pool_size = CacheEngine.get_all_cache_descs_and_pool_size(model_config=self.model_config,
+                                                                                cache_config=self.cache_config,
+                                                                                world_size=tp)
+            _, state_mem_pool_size = StateCacheEngine.get_state_cache_descs_and_pool_size(
+                self.cache_config.states_shapes)
+            shape, dtype = self.cache_config.states_shapes[0]
+            layer_num = shape[0]
+            state_mem_pool_size = state_mem_pool_size // layer_num
+            self.cache_config.block_size = (
+                (state_mem_pool_size - 1) // kv_mem_pool_size + 1) * self.cache_config.kernel_block_size
+
     def _get_state_cache_mem(self):
         """Get state cache mem usage."""
         cache_config = self.cache_config
@@ -184,13 +197,15 @@ class ExecutorBase:
 
     def update_configs(self):
         """Update cache config."""
+        tp = self.dist_config.attn_tp
+        model_config = self.model_config
+        cache_config = self.cache_config
+        cache_config.states_shapes = model_config.states_shapes
+
         self._adjust_block_size()
         # spec
         if self.specdecode_config and self.specdecode_config.cache_config:
             self.specdecode_config.cache_config.block_size = self.cache_config.block_size
-        cache_config = self.cache_config
-        model_config = self.model_config
-        cache_config.states_shapes = model_config.states_shapes
 
         # get free mems
         free_mems = self.gather_free_mem()
@@ -203,7 +218,6 @@ class ExecutorBase:
         assert free_mem > 0, 'No enough gpu memory for state cache. Please reduce max_batch_size.'
 
         vocal_size = self.model_config.vocab_size
-        tp = self.dist_config.attn_tp
         cache_block_size = CacheEngine.get_cache_block_size(cache_config, model_config, tp)
         spec_cache_config = None
         spec_model_config = None
